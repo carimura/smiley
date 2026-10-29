@@ -118,16 +118,23 @@ final class Doc: ObservableObject {
         }
         NSGraphicsContext.restoreGraphicsState()
 
-        let png = url.pathExtension.lowercased() == "png"
-        guard let data = png
-            ? rep.representation(using: .png, properties: [:])
-            : rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92]) else { return }
-        let out = url.deletingLastPathComponent()
-            .appendingPathComponent(url.deletingPathExtension().lastPathComponent + "-smiley")
-            .appendingPathExtension(png ? "png" : "jpg")
+        let data = NSMutableData()
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let type = CGImageSourceGetType(source),
+              let rendered = rep.cgImage,
+              let destination = CGImageDestinationCreateWithData(data, type, 1, nil) else {
+            flash("Save failed: image format cannot be written")
+            return
+        }
+        CGImageDestinationAddImage(destination, rendered,
+                                  [kCGImageDestinationLossyCompressionQuality: 0.92] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            flash("Save failed: image could not be encoded")
+            return
+        }
         do {
-            try data.write(to: out)
-            flash("Saved \(out.lastPathComponent) ✓")
+            try (data as Data).write(to: url, options: .atomic)
+            flash("Saved \(url.lastPathComponent) ✓")
         } catch {
             flash("Save failed: \(error.localizedDescription)")
         }
@@ -157,6 +164,9 @@ struct ContentView: View {
     @State private var dragBegan = false
     @State private var dragID: UUID?
     @State private var dragOrigin: CGPoint = .zero
+    @State private var resizing = false
+    @State private var dragFrac: CGFloat = 0
+    @State private var dragRadius: CGFloat = 0
 
     static let emojis = ["😀", "😁", "😊", "🙂", "😎", "🤪"]
 
@@ -280,7 +290,21 @@ struct ContentView: View {
                         let fit = fitRect(img.size, in: geo.size)
                         if !dragBegan {
                             dragBegan = true
-                            dragID = hitTest(v.startLocation, fit: fit)
+                            resizing = false
+                            if let s = doc.stamps.first(where: { $0.id == doc.selected }) {
+                                let center = CGPoint(x: fit.minX + s.pos.x * fit.width,
+                                                     y: fit.minY + s.pos.y * fit.height)
+                                let radius = (s.frac * fit.width + 10) / 2
+                                let distance = hypot(v.startLocation.x - center.x,
+                                                     v.startLocation.y - center.y)
+                                if abs(distance - radius) <= min(8, radius * 0.35) {
+                                    resizing = true
+                                    dragFrac = s.frac
+                                    dragRadius = distance
+                                    dragID = s.id
+                                }
+                            }
+                            if !resizing { dragID = hitTest(v.startLocation, fit: fit) }
                             doc.selected = dragID
                             if let id = dragID, let s = doc.stamps.first(where: { $0.id == id }) {
                                 dragOrigin = s.pos
@@ -288,11 +312,18 @@ struct ContentView: View {
                         }
                         guard let id = dragID,
                               let i = doc.stamps.firstIndex(where: { $0.id == id }) else { return }
-                        doc.stamps[i].pos = CGPoint(
-                            x: min(max(dragOrigin.x + v.translation.width / fit.width, 0), 1),
-                            y: min(max(dragOrigin.y + v.translation.height / fit.height, 0), 1))
+                        if resizing {
+                            let center = CGPoint(x: fit.minX + dragOrigin.x * fit.width,
+                                                 y: fit.minY + dragOrigin.y * fit.height)
+                            let radius = hypot(v.location.x - center.x, v.location.y - center.y)
+                            doc.stamps[i].frac = min(max(dragFrac + 2 * (radius - dragRadius) / fit.width, 0.02), 0.8)
+                        } else {
+                            doc.stamps[i].pos = CGPoint(
+                                x: min(max(dragOrigin.x + v.translation.width / fit.width, 0), 1),
+                                y: min(max(dragOrigin.y + v.translation.height / fit.height, 0), 1))
+                        }
                     }
-                    .onEnded { _ in dragBegan = false; dragID = nil }
+                    .onEnded { _ in dragBegan = false; dragID = nil; resizing = false }
             )
             .onContinuousHover { phase in
                 switch phase {
