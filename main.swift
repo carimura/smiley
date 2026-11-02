@@ -19,6 +19,10 @@ final class Doc: ObservableObject {
     @Published var selectMode = false
     @Published var frac: CGFloat = 0.15   // default size for new stamps
     @Published var note: String?
+    @Published var zoom: CGFloat = 1
+    @Published var pan: CGSize = .zero    // image center offset from canvas center, in view points
+    var canvas: CGSize = .zero { didSet { setPan(pan) } }
+    var cursor: CGPoint?                  // pointer in canvas coords; zoom anchor
     var url: URL?
 
     var image: NSImage? {
@@ -41,8 +45,38 @@ final class Doc: ObservableObject {
         stamps = []
         selected = nil
         selectMode = false
+        zoom = 1
+        pan = .zero
         self.url = url
         autoSmiley()
+    }
+
+    // Image rect in canvas coords, after zoom and pan
+    func viewRect(in size: CGSize) -> CGRect {
+        guard let cg = cgImage else { return .zero }
+        let f = fitRect(CGSize(width: cg.width, height: cg.height), in: size)
+        let w = f.width * zoom, h = f.height * zoom
+        return CGRect(x: (size.width - w) / 2 + pan.width, y: (size.height - h) / 2 + pan.height,
+                      width: w, height: h)
+    }
+
+    // Clamp so the zoomed image never leaves an empty gap inside the canvas
+    func setPan(_ p: CGSize) {
+        guard let cg = cgImage else { pan = .zero; return }
+        let f = fitRect(CGSize(width: cg.width, height: cg.height), in: canvas)
+        let mx = max((f.width * zoom - canvas.width) / 2, 0)
+        let my = max((f.height * zoom - canvas.height) / 2, 0)
+        pan = CGSize(width: min(max(p.width, -mx), mx), height: min(max(p.height, -my), my))
+    }
+
+    // Zoom by k, keeping the image point under `at` (canvas coords) fixed; nil = canvas center
+    func magnify(_ k: CGFloat, at p: CGPoint?) {
+        guard cgImage != nil else { return }
+        let k = min(max(zoom * k, 1), 20) / zoom
+        let ax = (p?.x ?? canvas.width / 2) - canvas.width / 2
+        let ay = (p?.y ?? canvas.height / 2) - canvas.height / 2
+        zoom *= k
+        setPan(CGSize(width: ax - (ax - pan.width) * k, height: ay - (ay - pan.height) * k))
     }
 
     func autoSmiley() {
@@ -62,7 +96,7 @@ final class Doc: ObservableObject {
                     let size = max(b.width, b.height * H / W) * 1.4
                     self.stamps.append(Stamp(
                         pos: CGPoint(x: b.midX, y: 1 - b.midY),
-                        frac: min(max(size, 0.02), 0.8),
+                        frac: min(max(size, 0.005), 0.8),
                         emoji: self.emoji))
                 }
                 self.selectMode = true   // ready to tweak: click a face, drag, ⌘+/⌘−
@@ -76,6 +110,8 @@ final class Doc: ObservableObject {
         stamps = []
         selected = nil
         selectMode = false
+        zoom = 1
+        pan = .zero
         url = nil
         note = nil
     }
@@ -93,9 +129,9 @@ final class Doc: ObservableObject {
 
     func resize(by m: CGFloat) {
         if let sel = selected, let i = stamps.firstIndex(where: { $0.id == sel }) {
-            stamps[i].frac = min(max(stamps[i].frac * m, 0.02), 0.8)
+            stamps[i].frac = min(max(stamps[i].frac * m, 0.005), 0.8)
         } else {
-            frac = min(max(frac * m, 0.05), 0.4)
+            frac = min(max(frac * m, 0.01), 0.4)
         }
     }
 
@@ -167,6 +203,7 @@ struct ContentView: View {
     @State private var resizing = false
     @State private var dragFrac: CGFloat = 0
     @State private var dragRadius: CGFloat = 0
+    @State private var panStart: CGSize = .zero
 
     static let emojis = ["😀", "😁", "😊", "🙂", "😎", "🤪"]
 
@@ -228,7 +265,7 @@ struct ContentView: View {
                 Text(note).foregroundStyle(.secondary)
             }
             Text("Size").foregroundStyle(.secondary)
-            Slider(value: $doc.frac, in: 0.05...0.4).frame(width: 140)
+            Slider(value: $doc.frac, in: 0.01...0.4).frame(width: 140)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -239,11 +276,11 @@ struct ContentView: View {
             ZStack {
                 Color(nsColor: .underPageBackgroundColor)
                 if let img = doc.image {
-                    let fit = fitRect(img.size, in: geo.size)
+                    let fit = doc.viewRect(in: geo.size)
                     Image(nsImage: img)
                         .resizable()
                         .frame(width: fit.width, height: fit.height)
-                        .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                        .position(x: fit.midX, y: fit.midY)
                     ForEach(doc.stamps) { s in
                         Text(s.emoji)
                             .font(.system(size: s.frac * fit.width))
@@ -273,10 +310,13 @@ struct ContentView: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
             .contentShape(Rectangle())
+            .onAppear { doc.canvas = geo.size }
+            .onChange(of: geo.size) { doc.canvas = $0 }
             .onTapGesture { loc in
-                guard !doc.selectMode, let img = doc.image else { return }
-                let fit = fitRect(img.size, in: geo.size)
+                guard !doc.selectMode, doc.cgImage != nil else { return }
+                let fit = doc.viewRect(in: geo.size)
                 guard fit.contains(loc) else { return }
                 doc.stamps.append(Stamp(
                     pos: CGPoint(x: (loc.x - fit.minX) / fit.width,
@@ -286,11 +326,12 @@ struct ContentView: View {
             .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { v in
-                        guard doc.selectMode, let img = doc.image else { return }
-                        let fit = fitRect(img.size, in: geo.size)
+                        guard doc.selectMode, doc.cgImage != nil else { return }
+                        let fit = doc.viewRect(in: geo.size)
                         if !dragBegan {
                             dragBegan = true
                             resizing = false
+                            panStart = doc.pan
                             if let s = doc.stamps.first(where: { $0.id == doc.selected }) {
                                 let center = CGPoint(x: fit.minX + s.pos.x * fit.width,
                                                      y: fit.minY + s.pos.y * fit.height)
@@ -311,7 +352,12 @@ struct ContentView: View {
                             }
                         }
                         guard let id = dragID,
-                              let i = doc.stamps.firstIndex(where: { $0.id == id }) else { return }
+                              let i = doc.stamps.firstIndex(where: { $0.id == id }) else {
+                            // dragging empty space pans the zoomed photo
+                            doc.setPan(CGSize(width: panStart.width + v.translation.width,
+                                              height: panStart.height + v.translation.height))
+                            return
+                        }
                         if resizing {
                             let center = CGPoint(x: fit.minX + dragOrigin.x * fit.width,
                                                  y: fit.minY + dragOrigin.y * fit.height)
@@ -327,8 +373,8 @@ struct ContentView: View {
             )
             .onContinuousHover { phase in
                 switch phase {
-                case .active(let p): hover = p
-                case .ended: hover = nil
+                case .active(let p): hover = p; doc.cursor = p
+                case .ended: hover = nil; doc.cursor = nil
                 }
             }
         }
@@ -351,6 +397,25 @@ struct ContentView: View {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    // Trackpad pinch or ⌘/⌥-scroll zooms at the pointer; plain scroll pans
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify]) { e in
+            let doc = Doc.shared
+            guard doc.cgImage != nil, let p = doc.cursor else { return e }
+            if e.type == .magnify {
+                doc.magnify(1 + e.magnification, at: p)
+                return nil
+            }
+            let m: CGFloat = e.hasPreciseScrollingDeltas ? 1 : 10
+            if !e.modifierFlags.intersection([.command, .option]).isEmpty {
+                doc.magnify(exp(e.scrollingDeltaY * m * 0.01), at: p)
+            } else {
+                doc.setPan(CGSize(width: doc.pan.width + e.scrollingDeltaX * m,
+                                  height: doc.pan.height + e.scrollingDeltaY * m))
+            }
+            return nil
+        }
+    }
     func application(_ application: NSApplication, open urls: [URL]) {
         if let u = urls.first { Doc.shared.open(u) }
     }
@@ -383,6 +448,13 @@ struct SmileyApp: App {
                 Divider()
                 Button("Bigger Face") { Doc.shared.resize(by: 1.2) }.keyboardShortcut("=")
                 Button("Smaller Face") { Doc.shared.resize(by: 1 / 1.2) }.keyboardShortcut("-")
+            }
+            CommandGroup(after: .toolbar) {
+                Button("Zoom In") { Doc.shared.magnify(1.5, at: nil) }
+                    .keyboardShortcut("=", modifiers: [.command, .option])
+                Button("Zoom Out") { Doc.shared.magnify(1 / 1.5, at: nil) }
+                    .keyboardShortcut("-", modifiers: [.command, .option])
+                Button("Fit Photo") { Doc.shared.magnify(0, at: nil) }.keyboardShortcut("0")
             }
         }
     }
